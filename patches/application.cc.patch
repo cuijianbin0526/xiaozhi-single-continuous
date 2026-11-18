@@ -1,0 +1,188 @@
+--- F:/esp/orig/main_application.cc	2026-11-18 19:34:28.159608600 +0800
++++ F:/esp/xiaozhi-build/main/application.cc	2026-11-18 21:06:41.978818200 +0800
+@@ -591,6 +591,10 @@
+     });
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
++        // [方案B/V1.0] 问候轮、"闭嘴"之后的上下行音频一律丢弃，不送解码队列
++        if (suppress_wakeup_reply_ || mute_reply_) {
++            return;
++        }
+         if (GetDeviceState() == kDeviceStateSpeaking) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+@@ -661,11 +665,36 @@
+                 return;
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
++                // [方案B/V1.0] 问候轮或硬停止后不进入 speaking
++                if (suppress_wakeup_reply_ || mute_reply_) {
++                    ESP_LOGW(TAG, "[方案B] 忽略 tts start（问候轮/硬停止）");
++                    return;
++                }
+                 Schedule([this]() {
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
++                // [V1.0] 硬停止：应答已被丢弃，保持待机，不重开监听
++                if (mute_reply_) {
++                    mute_reply_ = false;
++                    ESP_LOGI(TAG, "[V1.0] 硬停止应答已丢弃，保持待机");
++                    return;
++                }
++                // [方案B] 问候轮结束：先 stop 关掉服务端这一轮，再 start 开新轮，等用户说真话。
++                // 只发 start 不生效——服务端认为上一轮尚未结束，会忽略新的 start。
++                if (suppress_wakeup_reply_) {
++                    suppress_wakeup_reply_ = false;
++                    ESP_LOGW(TAG, "[方案B] 问候轮结束，stop+start 重开监听");
++                    Schedule([this]() {
++                        if (protocol_) {
++                            protocol_->SendStopListening();
++                            protocol_->SendStartListening(listening_mode_);
++                        }
++                        audio_service_.EnableVoiceProcessing(true);
++                    });
++                    return;
++                }
+                 Schedule([this]() {
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                         if (listening_mode_ == kListeningModeManualStop) {
+@@ -678,6 +707,11 @@
+             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+                 auto text = cJSON_GetObjectItem(root, "text");
+                 if (cJSON_IsString(text)) {
++                    // [方案B/V1.0] 问候轮或硬停止的文字不上屏
++                    if (suppress_wakeup_reply_ || mute_reply_) {
++                        ESP_LOGW(TAG, "[方案B] 忽略文本（问候轮/硬停止）: %s", text->valuestring);
++                        return;
++                    }
+                     std::vector<TextGlyph> glyphs;
+                     uint8_t bpp = 0;
+                     if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
+@@ -700,10 +734,68 @@
+                     glyphs.clear();
+                 }
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+-                Schedule([display, message = std::string(text->valuestring),
+-                          glyphs = std::move(glyphs), bpp]() {
++
++                // [方案B] 唤醒后的第一条 stt 是服务端对 detect 的回声（"小智"/"你好小智"），
++                // 不是用户真话。直接吞掉：不显示、不触发口令，并标记丢弃随后的问候 TTS。
++                if (wakeup_pending_) {
++                    wakeup_pending_ = false;
++                    suppress_wakeup_reply_ = true;
++                    ESP_LOGW(TAG, "[方案B] 唤醒回声 '%s' 已忽略，开始丢弃问候轮",
++                             text->valuestring);
++                    return;
++                }
++                // [方案B] 保险：收到真实用户发言说明已进入正常问答，清掉可能残留的丢弃标记，
++                // 否则一旦问候轮的 tts stop 丢失，后续所有 AI 回答都会被静音。
++                suppress_wakeup_reply_ = false;
++
++                // ===== [峰哥定制] 根据用户说的话切换单次/连续对话模式 =====
++                // 云端把用户说的话通过 stt 消息发回（就是识别后的文字），直接在这里
++                // 检测口令，识别率由云端大模型保证，不依赖本地唤醒词模型。
++                // stt 回调不在主线程，模式切换统一放进 Schedule 里执行，避免变量竞争。
++                std::string utterance = text->valuestring;
++                Schedule([this, display, message = std::move(utterance),
++                          glyphs = std::move(glyphs), bpp]() mutable {
+                     display->AddTextGlyphs(glyphs, bpp);
+                     display->SetChatMessage("user", message.c_str());
++
++                    auto contains = [&message](const char* keyword) {
++                        return message.find(keyword) != std::string::npos;
++                    };
++                    // [v3] 先判退出：停止类 / 单次类 / 结束·退出·关闭 + 连续
++                    //      新增"结束连续""退出连续"，覆盖"结束连续对话""退出连续对话"等说法
++                    bool exit_single = contains("停止") || contains("闭嘴") ||
++                                       contains("单次模式") || contains("单次唤醒") ||
++                                       contains("结束连续") || contains("退出连续") ||
++                                       (contains("关闭") && contains("连续"));
++                    // [v3] 再判进入：必须含"连续对话"，且不含任何否定词。
++                    //      排除"结束/停止/退出/单次"，否则"结束连续对话"只含"连续对话"、
++                    //      又不含"关闭"，会被 v2 误判成"进入连续"（历史 bug）。
++                    bool enter_continuous = contains("连续对话") &&
++                                            !contains("关闭") && !contains("结束") &&
++                                            !contains("停止") && !contains("退出") &&
++                                            !contains("单次");
++
++                    // [v3] exit 优先：一句话同时满足两个条件时，用户意图是"停下来"
++                    if (exit_single) {
++                        continuous_mode_ = false;
++                        listening_mode_ = kListeningModeManualStop;
++                        // [V1.0] "停止/闭嘴"要的是立刻没声音：服务端那句"好的，已关闭"
++                        // 也算声音，一并吞掉；"切换为单次模式"这类保留确认语。
++                        if (contains("停止") || contains("闭嘴")) {
++                            mute_reply_ = true;
++                            ESP_LOGI(TAG, "[V1.0] 硬停止：丢弃服务端随后的应答");
++                        }
++                        ESP_LOGI(TAG, "[峰哥定制] 口令 -> 单次唤醒模式 (ManualStop)");
++                        // 用户喊停：立即打断当前回答并回到待机，避免AI继续说个不停
++                        AbortSpeaking(kAbortReasonNone);
++                        while (audio_service_.PopPacketFromSendQueue()) {}
++                        SetDeviceState(kDeviceStateIdle);
++                    } else if (enter_continuous) {
++                        continuous_mode_ = true;
++                        // 同步监听模式：AI 说完这句话后，tts stop 会据此继续听，进入连续对话
++                        listening_mode_ = kListeningModeAutoStop;
++                        ESP_LOGI(TAG, "[峰哥定制] 口令 -> 连续对话模式 (AutoStop)");
++                    }
+                 });
+             }
+         } else if (strcmp(type->valuestring, "llm") == 0) {
+@@ -941,6 +1033,13 @@
+     auto wake_word = audio_service_.GetLastWakeWord();
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
++    // [峰哥定制] 模式切换改由云端 stt 文字识别负责（见 OnIncomingJson 的 stt 分支），
++    // 唤醒词只负责唤醒设备，不再根据唤醒词内容切换模式。
++
++    // [方案B] 每次唤醒都重置丢弃标记，避免上一次残留导致整轮回答被静音
++    suppress_wakeup_reply_ = false;
++    mute_reply_ = false;
++
+     if (state == kDeviceStateIdle) {
+         BeginWakeWordInvoke(wake_word);
+     } else if (state == kDeviceStateNotifying) {
+@@ -953,7 +1052,9 @@
+             ;
+ 
+         if (state == kDeviceStateListening) {
+-            protocol_->SendStartListening(GetDefaultListeningMode());
++            // [峰哥定制] 同步本地模式，确保 AI 说完话后按新模式决定"回待机/继续听"
++            listening_mode_ = GetDefaultListeningMode();
++            protocol_->SendStartListening(listening_mode_);
+             audio_service_.ResetDecoder();
+             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+             // Re-enable wake word detection as it was stopped by the detection itself
+@@ -1026,6 +1127,13 @@
+     // Set flag to play popup sound after state changes to listening
+     // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
+     play_popup_on_listening_ = true;
++    // [v5] 通知服务器"唤醒词命中"，但把 text 传空。
++    // 服务端收到 detect 才会进入识别状态（缺了它设备会一直上传音频却收不到 stt）；
++    // 但如果 text 带上"你好小智"，服务端会把唤醒词当成用户说的第一句话，
++    // 回一句招呼就结束，用户真正想说的话又丢了。传空即"只报状态、不报内容"。
++    protocol_->SendWakeWordDetected("");
++    // [方案B] 标记：接下来收到的第一条 stt 是服务端对 detect 的回声，不是用户真话
++    wakeup_pending_ = true;
+     SetListeningMode(GetDefaultListeningMode());
+ #endif
+ }
+@@ -1292,7 +1400,14 @@
+ }
+ 
+ ListeningMode Application::GetDefaultListeningMode() const {
+-    return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
++    // [峰哥定制] AEC 关闭时（本板子场景）按 continuous_mode_ 决定单次/连续：
++    //   单次模式 -> ManualStop：AI 说完一句就回待机
++    //   连续模式 -> AutoStop  ：AI 说完继续听，实现多轮连续对话
++    // AEC 开启时仍保持原来的 Realtime 逻辑，避免影响回声消除场景
++    if (aec_mode_ != kAecOff) {
++        return kListeningModeRealtime;
++    }
++    return continuous_mode_ ? kListeningModeAutoStop : kListeningModeManualStop;
+ }
+ 
+ void Application::Reboot() {

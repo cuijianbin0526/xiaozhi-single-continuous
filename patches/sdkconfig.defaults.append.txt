@@ -1,0 +1,8 @@
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_BUILD_DEMOS=n
+
+# [峰哥定制] 关闭"唤醒词音频作为对话第一句"上传
+# 官方默认 y 会把"你好小智"当成第一句话发给 AI，导致 AI 回完招呼就待机，
+# 用户随后真正想说的话收不到。关掉后唤醒只负责叫醒 + 播放"叮"，
+# 用户接着说的话才是第一句，单次/连续口令检测也更干净。
+CONFIG_SEND_WAKE_WORD_DATA=n

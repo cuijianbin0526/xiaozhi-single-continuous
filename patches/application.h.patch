@@ -1,0 +1,19 @@
+--- F:/esp/orig/main_application.h	2026-11-18 19:34:28.162607300 +0800
++++ F:/esp/xiaozhi-build/main/application.h	2026-11-18 20:52:57.835327300 +0800
+@@ -140,6 +140,16 @@
+     esp_timer_handle_t startup_wake_word_hint_timer_ = nullptr;
+     DeviceStateMachine state_machine_;
+     ListeningMode listening_mode_ = kListeningModeAutoStop;
++    // [峰哥定制] 对话模式开关：false=单次唤醒（默认），true=连续对话
++    bool continuous_mode_ = false;
++    // [方案B] 丢弃服务器因 detect 自动生成的那一轮问候：
++    //   wakeup_pending_      唤醒后等第一条 stt，用来识别"这是唤醒回声"而非用户真话
++    //   suppress_wakeup_reply_ 已确认是回声轮，丢弃其 tts 文本/音频，结束后重开监听
++    bool wakeup_pending_ = false;
++    bool suppress_wakeup_reply_ = false;
++    // [V1.0] "停止/闭嘴"要求立刻没声音：连服务端已经生成的应答也一并丢弃，
++    //        与 suppress_wakeup_reply_ 的区别是这个不重开监听，而是保持待机。
++    bool mute_reply_ = false;
+     AecMode aec_mode_ = kAecOff;
+     std::string last_error_message_;
+     std::string startup_wake_word_hint_message_;

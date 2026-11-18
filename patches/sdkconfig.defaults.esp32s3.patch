@@ -1,0 +1,14 @@
+--- F:/esp/orig/sdkconfig.defaults.esp32s3	2026-11-18 19:34:28.169838700 +0800
++++ F:/esp/xiaozhi-build/sdkconfig.defaults.esp32s3	2026-11-18 19:35:02.726421500 +0800
+@@ -29,6 +29,11 @@
+ 
+ CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
+ 
++# [v4] 恢复原版设置：监听状态下保持唤醒词检测（原版默认 y）。
++# 之前为 stt 方案关掉它，会让 AFE 在聆听时 disable WakeNet，
++# 而 WakeNet/AEC 的开关都会触发 AFE 重新配置，可能连带影响 VAD 与输出链路。
++CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=y
++
+ # LVGL Graphics
+ CONFIG_LV_USE_SNAPSHOT=y
+ # Builtin TLSF pool in PSRAM (lvgl_psram_pool.h). Keep the base pool small
